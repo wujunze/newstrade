@@ -1,0 +1,16 @@
+# Binaries
+newstrade
+
+# Go build cache
+*.test
+*.out
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
