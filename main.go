@@ -16,6 +16,10 @@ func main() {
 		log.Fatalf("init db: %v", err)
 	}
 
+	if err := service.MigrateDB(); err != nil {
+		log.Fatalf("migrate db: %v", err)
+	}
+
 	go service.RunSubscriber()
 
 	port := os.Getenv("PORT")
