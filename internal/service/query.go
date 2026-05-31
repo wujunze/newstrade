@@ -123,7 +123,7 @@ func joinCoins(p ListParams) string {
 	if p.Symbol == "" {
 		return ""
 	}
-	return "JOIN news_coins c ON c.news_id = a.id"
+	return " JOIN news_coins c ON c.news_id = a.id"
 }
 
 func buildWhere(p ListParams) (string, []any) {
