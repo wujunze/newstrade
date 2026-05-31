@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,10 @@ import (
 
 var db *sql.DB
 
+// dbOpTimeout bounds every database round trip so a stalled DB can never block
+// the ingest pipeline indefinitely.
+const dbOpTimeout = 10 * time.Second
+
 func InitDB() error {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
@@ -25,20 +30,41 @@ func InitDB() error {
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
-	if err = db.Ping(); err != nil {
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
+	if err = db.PingContext(ctx); err != nil {
 		return fmt.Errorf("ping db: %w", err)
 	}
 
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(3)
-	db.SetConnMaxLifetime(5 * time.Minute) // Bug4 fix: prevent stale connections
+	db.SetConnMaxLifetime(5 * time.Minute) // prevent stale connections
 
 	log.Println("database connected")
 	return nil
 }
 
+// CloseDB releases the connection pool.
+func CloseDB() error {
+	if db == nil {
+		return nil
+	}
+	return db.Close()
+}
+
+// PingDB reports whether the database is reachable. Used by the health check.
+func PingDB(ctx context.Context) error {
+	if db == nil {
+		return fmt.Errorf("db not initialised")
+	}
+	return db.PingContext(ctx)
+}
+
 func MigrateDB() error {
-	_, err := db.Exec(`
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS news_articles (
 			id          VARCHAR(255) PRIMARY KEY,
 			text        TEXT         NOT NULL DEFAULT '',
@@ -81,8 +107,9 @@ func MigrateDB() error {
 }
 
 func UpsertArticle(params *model.NewsParams, rawParams json.RawMessage) error {
-	if params.ArticleID() == "0" {
-		return fmt.Errorf("invalid article id: both id and newsId are 0")
+	articleID := params.ArticleID()
+	if articleID == "" {
+		return fmt.Errorf("invalid article id: both id and newsId are empty")
 	}
 
 	raw, err := marshalParams(params, rawParams)
@@ -90,7 +117,10 @@ func UpsertArticle(params *model.NewsParams, rawParams json.RawMessage) error {
 		return err
 	}
 
-	tx, err := db.Begin()
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
+
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -100,44 +130,48 @@ func UpsertArticle(params *model.NewsParams, rawParams json.RawMessage) error {
 	aiGrade := params.EffectiveAIGrade()
 	aiSignal := params.EffectiveAISignal()
 
-	articleID := params.ArticleID()
-	// Bug1 fix: use COALESCE so ai_score/grade/signal set by news.ai_update
-	// are never overwritten with NULL by a later news.update for the same id.
-	_, err = tx.Exec(`
+	// Field-preservation strategy for the same id seen across news.update and
+	// news.ai_update (which may arrive in either order and carry only a subset
+	// of fields):
+	//   - text/news_type/engine_type/link: keep existing value when the
+	//     incoming one is empty (COALESCE + NULLIF).
+	//   - ai_score/grade/signal/ts: keep existing when incoming is NULL.
+	//   - raw_json: shallow-merge so neither payload's keys are lost; the newer
+	//     message's keys win on conflict.
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO news_articles (id, text, news_type, engine_type, link, ai_score, ai_grade, ai_signal, ts, raw_json)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		ON CONFLICT (id) DO UPDATE SET
-			text        = EXCLUDED.text,
-			news_type   = EXCLUDED.news_type,
-			engine_type = EXCLUDED.engine_type,
-			link        = EXCLUDED.link,
+			text        = COALESCE(NULLIF(EXCLUDED.text, ''),        news_articles.text),
+			news_type   = COALESCE(NULLIF(EXCLUDED.news_type, ''),   news_articles.news_type),
+			engine_type = COALESCE(NULLIF(EXCLUDED.engine_type, ''), news_articles.engine_type),
+			link        = COALESCE(NULLIF(EXCLUDED.link, ''),        news_articles.link),
 			ai_score    = COALESCE(EXCLUDED.ai_score,  news_articles.ai_score),
 			ai_grade    = COALESCE(EXCLUDED.ai_grade,  news_articles.ai_grade),
 			ai_signal   = COALESCE(EXCLUDED.ai_signal, news_articles.ai_signal),
 			ts          = COALESCE(EXCLUDED.ts,        news_articles.ts),
-			raw_json    = EXCLUDED.raw_json
+			raw_json    = news_articles.raw_json || EXCLUDED.raw_json
 	`, articleID, params.Text, params.NewsType, params.EngineType, params.Link,
-		aiScore, aiGrade, aiSignal, params.Ts.T, raw)
+		aiScore, aiGrade, aiSignal, params.Ts.T, string(raw))
 	if err != nil {
 		return fmt.Errorf("upsert article: %w", err)
 	}
 
-	// Replace coins for this article.
-	_, err = tx.Exec(`DELETE FROM news_coins WHERE news_id = $1`, articleID)
-	if err != nil {
-		return fmt.Errorf("delete old coins: %w", err)
-	}
-
-	for _, c := range params.Coins {
-		matchField := nullableString(c.Match)
-		signal := nullableString(c.Signal)
-		grade := nullableString(c.Grade)
-		_, err = tx.Exec(`
-			INSERT INTO news_coins (news_id, symbol, market_type, match_field, score, signal, grade)
-			VALUES ($1,$2,$3,$4,$5,$6,$7)
-		`, articleID, c.Symbol, c.MarketType, matchField, c.Score, signal, grade)
-		if err != nil {
-			return fmt.Errorf("insert coin %s: %w", c.Symbol, err)
+	// Only replace coins when this message actually carries them, so a partial
+	// news.ai_update can't wipe coins recorded by an earlier news.update.
+	if len(params.Coins) > 0 {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM news_coins WHERE news_id = $1`, articleID); err != nil {
+			return fmt.Errorf("delete old coins: %w", err)
+		}
+		for _, c := range params.Coins {
+			_, err = tx.ExecContext(ctx, `
+				INSERT INTO news_coins (news_id, symbol, market_type, match_field, score, signal, grade)
+				VALUES ($1,$2,$3,$4,$5,$6,$7)
+			`, articleID, c.Symbol, nullableString(c.MarketType), nullableString(c.Match),
+				c.Score, nullableString(c.Signal), nullableString(c.Grade))
+			if err != nil {
+				return fmt.Errorf("insert coin %s: %w", c.Symbol, err)
+			}
 		}
 	}
 

@@ -1,0 +1,19 @@
+# VCS / local
+.git
+.gitignore
+
+# Binaries & build artifacts
+newstrade
+*.test
+*.out
+
+# Environment / secrets
+.env
+.env.local
+
+# Logs & OS cruft
+*.log
+.DS_Store
+
+# Docs
+*.md

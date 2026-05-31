@@ -2,29 +2,40 @@ package model
 
 import (
 	"encoding/json"
+	"log"
 	"strconv"
 	"time"
 )
 
 type WSSMessage struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      interface{}     `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  json.RawMessage `json:"params,omitempty"`
+	JSONRPC string           `json:"jsonrpc"`
+	ID      interface{}      `json:"id,omitempty"`
+	Method  string           `json:"method,omitempty"`
+	Params  json.RawMessage  `json:"params,omitempty"`
 	Result  *SubscribeResult `json:"result,omitempty"`
+	Error   *RPCError        `json:"error,omitempty"`
 }
 
 type SubscribeResult struct {
 	Success bool `json:"success"`
 }
 
+type RPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
 // NewsParams covers both news.update and news.ai_update payloads.
 //
-// news.update  → id (int64), optional aiRating nested object
-// news.ai_update → newsId (int64), top-level score/grade/signal fields
+// news.update  → id, optional aiRating nested object
+// news.ai_update → newsId, top-level score/grade/signal fields
+//
+// id/newsId may arrive as a JSON number or a quoted string, so they are
+// parsed with FlexID which preserves the original textual form. This matches
+// the VARCHAR primary key column and avoids int64 overflow / parse failures.
 type NewsParams struct {
-	ID         int64      `json:"id"`
-	NewsID     int64      `json:"newsId"`
+	ID         FlexID     `json:"id"`
+	NewsID     FlexID     `json:"newsId"`
 	Text       string     `json:"text"`
 	NewsType   string     `json:"newsType"`
 	EngineType string     `json:"engineType"`
@@ -42,15 +53,12 @@ type NewsParams struct {
 }
 
 // ArticleID returns the article ID as a string.
-// Returns "0" only when both id and newsId are zero (caller should reject).
+// Returns "" only when both id and newsId are empty/zero (caller should reject).
 func (p *NewsParams) ArticleID() string {
-	if p.ID != 0 {
-		return strconv.FormatInt(p.ID, 10)
+	if id := p.ID.String(); id != "" {
+		return id
 	}
-	if p.NewsID != 0 {
-		return strconv.FormatInt(p.NewsID, 10)
-	}
-	return "0"
+	return p.NewsID.String()
 }
 
 // EffectiveAIScore returns the AI score from whichever source has it.
@@ -86,27 +94,78 @@ func (p *NewsParams) EffectiveAISignal() *string {
 	return nil
 }
 
+// FlexID parses an id that may be a JSON number or a quoted string.
+// The zero value (empty string) means "absent".
+type FlexID string
+
+func (f *FlexID) UnmarshalJSON(b []byte) error {
+	s := string(b)
+	if s == "null" || s == "" {
+		*f = ""
+		return nil
+	}
+	// Quoted string form: "12345" → 12345
+	if s[0] == '"' {
+		var str string
+		if err := json.Unmarshal(b, &str); err != nil {
+			return err
+		}
+		*f = FlexID(str)
+		return nil
+	}
+	// Numeric form. Normalise to an integer string when it is an integer so a
+	// number and its string twin map to the same primary key. Trim a trailing
+	// ".0"-style fraction defensively if the source ever emits a float.
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		*f = FlexID(strconv.FormatInt(n, 10))
+		return nil
+	}
+	*f = FlexID(s)
+	return nil
+}
+
+// String returns the id text, or "" for the zero/"0" value.
+func (f FlexID) String() string {
+	s := string(f)
+	if s == "0" {
+		return ""
+	}
+	return s
+}
+
 // FlexTime parses ts that may be an int64 (Unix ms) or an ISO 8601 string.
 type FlexTime struct {
 	T *time.Time
 }
 
 func (f *FlexTime) UnmarshalJSON(b []byte) error {
+	s := string(b)
+	if s == "null" || s == "" {
+		f.T = nil
+		return nil
+	}
+
 	var ms int64
 	if err := json.Unmarshal(b, &ms); err == nil && ms > 0 {
 		t := time.UnixMilli(ms)
 		f.T = &t
 		return nil
 	}
-	var s string
-	if err := json.Unmarshal(b, &s); err == nil && s != "" {
+	var str string
+	if err := json.Unmarshal(b, &str); err == nil {
+		if str == "" {
+			f.T = nil
+			return nil
+		}
 		for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
-			if t, err := time.Parse(layout, s); err == nil {
+			if t, err := time.Parse(layout, str); err == nil {
 				f.T = &t
 				return nil
 			}
 		}
 	}
+	// Unparseable but non-empty: surface it instead of silently dropping.
+	log.Printf("warning: could not parse ts %s", s)
 	f.T = nil
 	return nil
 }
