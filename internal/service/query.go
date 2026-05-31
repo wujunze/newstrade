@@ -58,28 +58,34 @@ func ListArticles(params ListParams) (*ListResult, error) {
 	where, args := buildWhere(params)
 	offset := (params.Page - 1) * params.PageSize
 
-	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
-	defer cancel()
-
-	// count query
-	countQ := `SELECT COUNT(DISTINCT a.id) FROM news_articles a` + joinCoins(params) + where
 	var total int
-	if err := db.QueryRowContext(ctx, countQ, args...).Scan(&total); err != nil {
-		return nil, fmt.Errorf("count: %w", err)
+
+	// count query — own timeout so later queries get a full budget
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+		defer cancel()
+		countQ := `SELECT COUNT(DISTINCT a.id) FROM news_articles a` + joinCoins(params) + where
+		if err := db.QueryRowContext(ctx, countQ, args...).Scan(&total); err != nil {
+			return nil, fmt.Errorf("count: %w", err)
+		}
 	}
 
-	// data query — cursor-friendly ORDER BY created_at DESC
+	// data query — DISTINCT prevents duplicate rows when an article has multiple
+	// matching coin rows (e.g. BTC-SPOT and BTC-PERP both satisfy symbol=BTC).
 	nextArg := len(args) + 1
 	dataQ := fmt.Sprintf(`
-		SELECT a.id, a.text, a.news_type, a.engine_type, a.link,
+		SELECT DISTINCT ON (a.created_at, a.id)
+		       a.id, a.text, a.news_type, a.engine_type, a.link,
 		       a.ai_score, a.ai_grade, a.ai_signal, a.ts, a.created_at
 		FROM news_articles a
 		%s
 		%s
-		ORDER BY a.created_at DESC
+		ORDER BY a.created_at DESC, a.id
 		LIMIT $%d OFFSET $%d`,
 		joinCoins(params), where, nextArg, nextArg+1)
 
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
 	rows, err := db.QueryContext(ctx, dataQ, append(args, params.PageSize, offset)...)
 	if err != nil {
 		return nil, fmt.Errorf("query: %w", err)
